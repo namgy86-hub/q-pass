@@ -37,16 +37,11 @@
     <div id="view-home" class="relative flex flex-col items-center justify-center min-h-screen p-4 bg-gradient-to-br from-indigo-50 to-blue-50">
         <div class="bg-white p-10 rounded-3xl shadow-2xl max-w-lg w-full text-center border border-indigo-100/50">
             <h1 class="text-5xl font-black text-indigo-600 mb-2 tracking-tight">Q-PASS</h1>
-            <p class="text-gray-500 font-medium mb-10">급식소 대기인원 실시간 알리미</p>
+            <p class="text-gray-500 font-medium mb-10">급식소 대기인원 실시간 알리미 (클라우드 연동)</p>
             
             <button onclick="app.showUserMode()" class="w-full py-8 px-6 bg-gradient-to-r from-blue-500 to-indigo-600 hover:from-blue-600 hover:to-indigo-700 text-white rounded-2xl font-black text-2xl shadow-xl hover:shadow-2xl transition-all duration-300 transform hover:-translate-y-1 flex flex-col items-center justify-center gap-4">
                 <span class="text-5xl">🚦</span>
                 <span>급식소 대기 신호등 확인하기</span>
-            </button>
-
-            <!-- 듀얼 테스트 모드 버튼 신설 -->
-            <button onclick="app.showSplitMode()" class="w-full mt-4 py-4 px-6 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-2xl font-bold text-lg shadow-sm border border-gray-200 transition-all flex items-center justify-center gap-2">
-                👀 한 화면에서 연동 테스트 (분할 모드)
             </button>
         </div>
 
@@ -80,7 +75,7 @@
 
         <div class="text-center mb-6 mt-12 z-10">
             <h2 class="text-3xl sm:text-4xl font-black text-white tracking-tight drop-shadow-md">급식소 대기 신호등</h2>
-            <p id="user-status-text" class="text-xl sm:text-2xl font-bold text-green-400 drop-shadow-lg mt-2">대기 정보를 가져오고 있습니다...</p>
+            <p id="user-status-text" class="text-xl sm:text-2xl font-bold text-green-400 drop-shadow-lg mt-2">클라우드 연결 중...</p>
         </div>
 
         <div class="bg-gray-800 p-4 sm:p-6 rounded-[3rem] border-8 border-gray-700 shadow-[0_0_50px_rgba(0,0,0,0.5)] flex flex-col gap-4 sm:gap-6 items-center z-10 w-full max-w-[200px] sm:max-w-[250px]">
@@ -168,111 +163,89 @@
         </div>
     </div>
 
-    <!-- UI 및 메인 로직 -->
-    <script>
+    <!-- 파이어베이스 SDK (v11 모듈 방식) -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-app.js";
+        import { getFirestore, doc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-firestore.js";
+
+        // =====================================================================
+        // 🚨 실제 파이어베이스 설정값 적용 완료!
+        // =====================================================================
+        const firebaseConfig = {
+            apiKey: "AIzaSyC2l9SaMCtLysQdD78MjNBpIiWZJP2To1w",
+            authDomain: "qpass-app.firebaseapp.com",
+            projectId: "qpass-app",
+            storageBucket: "qpass-app.firebasestorage.app",
+            messagingSenderId: "314970797856",
+            appId: "1:314970797856:web:9fe6f638947d67ef5b4945"
+        };
+        // =====================================================================
+
+        // 파이어베이스 초기화
+        const fApp = initializeApp(firebaseConfig);
+        const db = getFirestore(fApp);
+        
+        // 데이터가 저장될 클라우드 문서 경로 (qpass/current_state)
+        const stateDoc = doc(db, 'qpass', 'current_state');
+
+        // 전역 앱 로직
         const app = {
             THRESHOLD_YELLOW: 11,
             THRESHOLD_RED: 31,
 
-            model: null,
-            video: null,
-            canvas: null,
-            ctx: null,
-            isDetecting: false,
-            animationId: null,
-            stream: null,
-            wakeLock: null, 
+            model: null, video: null, canvas: null, ctx: null,
+            isDetecting: false, animationId: null, stream: null, wakeLock: null, 
             modalCallback: null, 
             
-            // 🌟 신규 핵심: 메모리 기반 상태 관리 객체 (스토리지 의존성 100% 제거)
-            state: {
-                count: 0,
-                alert: 'none'
-            },
-            
-            // 탭 간 통신용 채널
-            syncChannel: null,
+            // 메모리 상태 관리
+            state: { count: 0, alert: 'none' },
             lastSentCount: -1,
+            lastSyncTime: 0,
 
             init() {
                 this.video = document.getElementById('webcam');
                 this.canvas = document.getElementById('canvas');
                 this.ctx = this.canvas.getContext('2d');
                 
-                // BroadcastChannel 초기화 (같은 브라우저 내 다른 탭 연결용)
-                this.syncChannel = new BroadcastChannel('qpass_sync_channel');
-                this.syncChannel.onmessage = (event) => {
-                    const data = event.data;
-                    
-                    // 다른 탭에서 들어온 새로운 상태 업데이트 적용
-                    if (data.type === 'state_update') {
+                // ☁️ [클라우드 데이터 수신] Firestore 실시간 감지
+                onSnapshot(stateDoc, (doc) => {
+                    if (doc.exists()) {
+                        const data = doc.data();
                         if (data.count !== undefined) this.state.count = data.count;
                         if (data.alert !== undefined) this.state.alert = data.alert;
+                        
                         this.updateUserView();
                         this.updateNextGradeAlertView();
                     }
-                    
-                    // 신호등(User) 탭이 새로 열렸을 때 관리자(Admin) 탭에게 현재 값을 요청함
-                    if (data.type === 'request_state') {
-                        if (this.isDetecting) {
-                            this.syncChannel.postMessage({
-                                type: 'state_update',
-                                count: this.state.count,
-                                alert: this.state.alert
-                            });
-                        }
-                    }
-                };
-            },
-
-            // 🌟 분할 모드 (하나의 화면에서 두 가지를 동시에 보여줌)
-            showSplitMode() {
-                this.showModal({
-                    title: "관리자 인증 (분할 모드)",
-                    desc: "카메라를 구동하기 위해\n관리자 비밀번호를 입력하세요.",
-                    type: "prompt",
-                    isPassword: true,
-                    placeholder: "비밀번호를 입력하세요",
-                    onConfirm: (password) => {
-                        if (password === "2026") {
-                            this.hideAllViews();
-                            document.body.classList.add('lg:grid', 'lg:grid-cols-2');
-                            
-                            const userView = document.getElementById('view-user');
-                            const adminView = document.getElementById('view-admin');
-                            
-                            userView.classList.remove('hidden', 'min-h-[100dvh]');
-                            userView.classList.add('flex', 'min-h-screen');
-                            
-                            adminView.classList.remove('hidden', 'min-h-screen');
-                            adminView.classList.add('flex', 'min-h-screen', 'border-l-4', 'border-gray-800');
-                            
-                            // 메모리 상태 기반 UI 즉시 렌더링
-                            this.updateUserView();
-                            this.updateNextGradeAlertView();
-                            
-                            // 인증 완료 후 카메라 작동
-                            this.startAdminMode();
-                        } else if (password !== "") {
-                            this.showModal({ title: "인증 실패", desc: "비밀번호가 일치하지 않습니다.", type: "alert" });
-                        }
-                    }
+                }, (error) => {
+                    console.error("클라우드 수신 에러:", error);
                 });
             },
 
-            hideAllViews() {
-                document.body.classList.remove('lg:grid', 'lg:grid-cols-2');
-                
-                const userView = document.getElementById('view-user');
-                userView.classList.add('hidden', 'min-h-[100dvh]');
-                userView.classList.remove('flex', 'min-h-screen');
-                
-                const adminView = document.getElementById('view-admin');
-                adminView.classList.add('hidden', 'min-h-screen');
-                adminView.classList.remove('flex', 'min-h-screen', 'border-l-4', 'border-gray-800');
+            // ☁️ [클라우드 데이터 송신] Firestore 저장 기능 (과부하 방지 쓰로틀링 적용)
+            async syncToCloud(force = false) {
+                const now = Date.now();
+                // 1초(1000ms)에 한 번씩만 클라우드로 전송하거나, 버튼 클릭 시엔 즉시(force) 전송
+                if (force || now - this.lastSyncTime > 1000) {
+                    this.lastSyncTime = now;
+                    try {
+                        await setDoc(stateDoc, {
+                            count: this.state.count,
+                            alert: this.state.alert
+                        });
+                    } catch (e) {
+                        console.error("클라우드 송신 에러 (규칙 설정이 '테스트 모드'인지 확인하세요):", e);
+                    }
+                }
+            },
 
+            hideAllViews() {
                 document.getElementById('view-home').classList.add('hidden');
                 document.getElementById('view-home').classList.remove('flex');
+                document.getElementById('view-user').classList.add('hidden');
+                document.getElementById('view-user').classList.remove('flex');
+                document.getElementById('view-admin').classList.add('hidden');
+                document.getElementById('view-admin').classList.remove('flex');
             },
 
             toggleFullScreen() {
@@ -284,23 +257,16 @@
             },
 
             async requestWakeLock() {
-                try {
-                    if ('wakeLock' in navigator) this.wakeLock = await navigator.wakeLock.request('screen');
-                } catch (err) {}
+                try { if ('wakeLock' in navigator) this.wakeLock = await navigator.wakeLock.request('screen'); } catch (err) {}
             },
-
             releaseWakeLock() {
-                if (this.wakeLock !== null) {
-                    this.wakeLock.release().then(() => { this.wakeLock = null; });
-                }
+                if (this.wakeLock !== null) { this.wakeLock.release().then(() => { this.wakeLock = null; }); }
             },
 
             goHome() {
                 this.stopAdminMode();
                 this.releaseWakeLock(); 
-                
                 if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen();
-
                 this.hideAllViews();
                 document.getElementById('view-home').classList.remove('hidden');
                 document.getElementById('view-home').classList.add('flex');
@@ -325,9 +291,7 @@
                 this.modalCallback = options.onConfirm || null;
                 modal.classList.remove('hidden');
 
-                document.getElementById('modal-cancel').onclick = () => {
-                    modal.classList.add('hidden');
-                };
+                document.getElementById('modal-cancel').onclick = () => { modal.classList.add('hidden'); };
                 document.getElementById('modal-confirm').onclick = () => {
                     const val = inputEl.value;
                     modal.classList.add('hidden');
@@ -339,13 +303,9 @@
                 this.hideAllViews();
                 document.getElementById('view-user').classList.remove('hidden');
                 document.getElementById('view-user').classList.add('flex');
-                
                 this.requestWakeLock();
                 this.updateUserView();
                 this.updateNextGradeAlertView();
-                
-                // 만약 관리자 탭이 따로 열려있다면 현재 값을 달라고 방송(요청)함
-                this.syncChannel.postMessage({ type: 'request_state' });
             },
 
             showAdminMode() {
@@ -368,10 +328,8 @@
                 });
             },
 
-            // 🌟 신규 핵심: 메모리 변수(this.state.count)만을 참조하여 즉시 그리기
             updateUserView() {
                 const count = this.state.count;
-                
                 const userCountEl = document.getElementById('user-person-count');
                 if (!userCountEl) return;
                 userCountEl.innerText = count;
@@ -421,21 +379,13 @@
 
             toggleGradeAlert(type) {
                 const nextAlert = (this.state.alert === type) ? 'none' : type;
-                
-                // 메모리 즉시 갱신
                 this.state.alert = nextAlert;
                 
-                // 브로드캐스트 채널로 다른 탭들에 전파
-                this.syncChannel.postMessage({
-                    type: 'state_update',
-                    count: this.state.count,
-                    alert: nextAlert
-                });
-
+                // ☁️ 상태 변경 즉시 클라우드 업로드
+                this.syncToCloud(true);
                 this.updateNextGradeAlertView();
             },
 
-            // 🌟 신규 핵심: 메모리 변수(this.state.alert)만을 참조하여 즉시 그리기
             updateNextGradeAlertView() {
                 const activeAlert = this.state.alert;
                 const banner = document.getElementById('next-grade-banner');
@@ -475,36 +425,21 @@
 
             async startAdminMode() {
                 if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-                    this.showModal({
-                        title: "카메라 사용 불가 ⚠️",
-                        desc: "현재 환경에서는 카메라를 사용할 수 없습니다.\n보안 연결(HTTPS/localhost) 환경인지 확인하세요.",
-                        type: "alert",
-                        onConfirm: () => this.goHome()
-                    });
+                    this.showModal({ title: "카메라 사용 불가", desc: "카메라 환경을 확인해주세요.", type: "alert", onConfirm: () => this.goHome() });
                     return;
                 }
 
                 document.getElementById('loading-overlay').classList.remove('hidden');
 
                 try {
-                    this.stream = await navigator.mediaDevices.getUserMedia({ 
-                        video: { facingMode: 'environment', width: { ideal: 640 }, height: { ideal: 480 } }, 
-                        audio: false 
-                    });
+                    this.stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment', width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
                     this.video.srcObject = this.stream;
-                    
-                    await new Promise((resolve) => {
-                        this.video.onloadedmetadata = () => { resolve(); };
-                    });
-                    
+                    await new Promise((resolve) => { this.video.onloadedmetadata = () => { resolve(); }; });
                     try { await this.video.play(); } catch(e) {}
-
                     this.canvas.width = this.video.videoWidth;
                     this.canvas.height = this.video.videoHeight;
 
-                    if (!this.model) {
-                        this.model = await cocoSsd.load();
-                    }
+                    if (!this.model) this.model = await cocoSsd.load();
 
                     document.getElementById('loading-overlay').classList.add('hidden');
                     document.getElementById('admin-model-status').innerText = "작동중 (정상)";
@@ -512,15 +447,9 @@
                     
                     this.isDetecting = true;
                     this.detectFrame();
-
                 } catch (err) {
                     document.getElementById('loading-overlay').classList.add('hidden');
-                    this.showModal({
-                        title: "오류 안내",
-                        desc: "카메라 접근 권한이 거부되었거나 연결할 수 없습니다.",
-                        type: "alert",
-                        onConfirm: () => this.goHome()
-                    });
+                    this.showModal({ title: "오류", desc: "카메라 연결에 실패했습니다.", type: "alert", onConfirm: () => this.goHome() });
                 }
             },
 
@@ -536,15 +465,10 @@
                     
                     persons.forEach(person => {
                         const [x, y, width, height] = person.bbox;
-                        this.ctx.strokeStyle = '#00FF00'; 
-                        this.ctx.lineWidth = 4;
+                        this.ctx.strokeStyle = '#00FF00'; this.ctx.lineWidth = 4;
                         this.ctx.strokeRect(x, y, width, height);
-
-                        this.ctx.fillStyle = '#00FF00';
-                        this.ctx.fillRect(x, y - 24, 100, 24);
-
-                        this.ctx.fillStyle = '#000000';
-                        this.ctx.font = '16px sans-serif';
+                        this.ctx.fillStyle = '#00FF00'; this.ctx.fillRect(x, y - 24, 100, 24);
+                        this.ctx.fillStyle = '#000000'; this.ctx.font = '16px sans-serif';
                         this.ctx.fillText(`사람 (${Math.round(person.score * 100)}%)`, x + 5, y - 6);
                     });
 
@@ -552,37 +476,21 @@
                     const statusEl = document.getElementById('admin-status-text');
                     
                     if (personCount >= this.THRESHOLD_RED) {
-                        statusEl.innerText = "혼잡 (빨강)";
-                        statusEl.className = "text-2xl font-bold text-red-500 mt-2";
+                        statusEl.innerText = "혼잡 (빨강)"; statusEl.className = "text-2xl font-bold text-red-500 mt-2";
                     } else if (personCount >= this.THRESHOLD_YELLOW) {
-                        statusEl.innerText = "보통 (노랑)";
-                        statusEl.className = "text-2xl font-bold text-yellow-500 mt-2";
+                        statusEl.innerText = "보통 (노랑)"; statusEl.className = "text-2xl font-bold text-yellow-500 mt-2";
                     } else {
-                        statusEl.innerText = "여유 (초록)";
-                        statusEl.className = "text-2xl font-bold text-green-500 mt-2";
+                        statusEl.innerText = "여유 (초록)"; statusEl.className = "text-2xl font-bold text-green-500 mt-2";
                     }
 
-                    // 메모리 상태 즉시 업데이트
-                    this.state.count = personCount;
-
-                    // 분할(듀얼) 모드일 때 즉각적으로 우측 신호등 UI 갱신 반영
-                    const isDualMode = document.body.classList.contains('lg:grid');
-                    if (isDualMode) {
-                        this.updateUserView();
-                    }
-
-                    // 다른 창(탭)이 켜져 있을 때 방송하기
+                    // ☁️ 인원수가 변경되었을 때만 클라우드에 업로드 시도
                     if (this.lastSentCount !== personCount) {
                         this.lastSentCount = personCount;
-                        this.syncChannel.postMessage({
-                            type: 'state_update',
-                            count: personCount,
-                            alert: this.state.alert
-                        });
+                        this.state.count = personCount;
+                        this.syncToCloud(false); // 쓰로틀링(1초 간격) 전송
                     }
 
                     this.animationId = requestAnimationFrame(() => this.detectFrame());
-                    
                 } catch (err) {
                     this.animationId = requestAnimationFrame(() => this.detectFrame());
                 }
@@ -591,26 +499,18 @@
             stopAdminMode() {
                 this.isDetecting = false;
                 if (this.animationId) cancelAnimationFrame(this.animationId);
-                if (this.stream) {
-                    this.stream.getTracks().forEach(track => track.stop());
-                    this.stream = null;
-                }
+                if (this.stream) { this.stream.getTracks().forEach(track => track.stop()); this.stream = null; }
                 this.video.srcObject = null;
                 if(this.ctx && this.canvas) this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
                 
                 this.state.count = 0;
-                this.syncChannel.postMessage({
-                    type: 'state_update',
-                    count: 0,
-                    alert: this.state.alert
-                });
+                this.syncToCloud(true); // 0으로 초기화 후 강제 전송
             }
         };
 
+        // 앱 시작
         window.app = app;
-        window.onload = () => { 
-            app.init(); 
-        };
+        window.onload = () => { app.init(); };
     </script>
 </body>
 </html>
