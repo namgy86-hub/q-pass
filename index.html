@@ -184,44 +184,48 @@
             wakeLock: null, 
             modalCallback: null, 
             
-            // 로컬 파일/동일 오리진 환경 간 완벽 동기화를 위한 브로드캐스트 채널
-            syncChannel: new BroadcastChannel('qpass_sync_channel'),
+            // 🌟 신규 핵심: 메모리 기반 상태 관리 객체 (스토리지 의존성 100% 제거)
+            state: {
+                count: 0,
+                alert: 'none'
+            },
+            
+            // 탭 간 통신용 채널
+            syncChannel: null,
             lastSentCount: -1,
-            lastSentAlert: '',
 
             init() {
                 this.video = document.getElementById('webcam');
                 this.canvas = document.getElementById('canvas');
                 this.ctx = this.canvas.getContext('2d');
                 
-                try {
-                    if(!localStorage.getItem('qpass_count')) localStorage.setItem('qpass_count', '0');
-                    if(!localStorage.getItem('qpass_active_alert')) localStorage.setItem('qpass_active_alert', 'none');
-                } catch(e) {}
-
-                // BroadcastChannel을 통한 실시간 수신 (크로스 탭 지원)
+                // BroadcastChannel 초기화 (같은 브라우저 내 다른 탭 연결용)
+                this.syncChannel = new BroadcastChannel('qpass_sync_channel');
                 this.syncChannel.onmessage = (event) => {
                     const data = event.data;
+                    
+                    // 다른 탭에서 들어온 새로운 상태 업데이트 적용
                     if (data.type === 'state_update') {
-                        if (data.count !== undefined) {
-                            try { localStorage.setItem('qpass_count', data.count.toString()); } catch(e){}
-                        }
-                        if (data.alert !== undefined) {
-                            try { localStorage.setItem('qpass_active_alert', data.alert); } catch(e){}
-                        }
+                        if (data.count !== undefined) this.state.count = data.count;
+                        if (data.alert !== undefined) this.state.alert = data.alert;
                         this.updateUserView();
                         this.updateNextGradeAlertView();
                     }
+                    
+                    // 신호등(User) 탭이 새로 열렸을 때 관리자(Admin) 탭에게 현재 값을 요청함
+                    if (data.type === 'request_state') {
+                        if (this.isDetecting) {
+                            this.syncChannel.postMessage({
+                                type: 'state_update',
+                                count: this.state.count,
+                                alert: this.state.alert
+                            });
+                        }
+                    }
                 };
-
-                // 구버전 호환용 (localStorage fallback)
-                window.addEventListener('storage', (e) => {
-                    if (e.key === 'qpass_count') this.updateUserView();
-                    if (e.key === 'qpass_active_alert') this.updateNextGradeAlertView();
-                });
             },
 
-            // 🌟 신규: 분할 모드 (하나의 화면에서 두 가지를 동시에 보여줌)
+            // 🌟 분할 모드 (하나의 화면에서 두 가지를 동시에 보여줌)
             showSplitMode() {
                 this.showModal({
                     title: "관리자 인증 (분할 모드)",
@@ -237,13 +241,13 @@
                             const userView = document.getElementById('view-user');
                             const adminView = document.getElementById('view-admin');
                             
-                            // 분할 시 레이아웃 깨짐 방지 클래스 조정
                             userView.classList.remove('hidden', 'min-h-[100dvh]');
                             userView.classList.add('flex', 'min-h-screen');
                             
                             adminView.classList.remove('hidden', 'min-h-screen');
                             adminView.classList.add('flex', 'min-h-screen', 'border-l-4', 'border-gray-800');
                             
+                            // 메모리 상태 기반 UI 즉시 렌더링
                             this.updateUserView();
                             this.updateNextGradeAlertView();
                             
@@ -257,7 +261,6 @@
             },
 
             hideAllViews() {
-                // 분할 모드 관련 클래스 제거
                 document.body.classList.remove('lg:grid', 'lg:grid-cols-2');
                 
                 const userView = document.getElementById('view-user');
@@ -340,6 +343,9 @@
                 this.requestWakeLock();
                 this.updateUserView();
                 this.updateNextGradeAlertView();
+                
+                // 만약 관리자 탭이 따로 열려있다면 현재 값을 달라고 방송(요청)함
+                this.syncChannel.postMessage({ type: 'request_state' });
             },
 
             showAdminMode() {
@@ -362,8 +368,10 @@
                 });
             },
 
+            // 🌟 신규 핵심: 메모리 변수(this.state.count)만을 참조하여 즉시 그리기
             updateUserView() {
-                const count = parseInt(localStorage.getItem('qpass_count')) || 0;
+                const count = this.state.count;
+                
                 const userCountEl = document.getElementById('user-person-count');
                 if (!userCountEl) return;
                 userCountEl.innerText = count;
@@ -412,23 +420,24 @@
             },
 
             toggleGradeAlert(type) {
-                const currentAlert = localStorage.getItem('qpass_active_alert') || 'none';
-                const nextAlert = (currentAlert === type) ? 'none' : type;
+                const nextAlert = (this.state.alert === type) ? 'none' : type;
                 
-                try { localStorage.setItem('qpass_active_alert', nextAlert); } catch(e) {}
+                // 메모리 즉시 갱신
+                this.state.alert = nextAlert;
                 
-                // 브로드캐스트 채널로 상태 전송
+                // 브로드캐스트 채널로 다른 탭들에 전파
                 this.syncChannel.postMessage({
                     type: 'state_update',
-                    count: parseInt(localStorage.getItem('qpass_count')) || 0,
+                    count: this.state.count,
                     alert: nextAlert
                 });
 
                 this.updateNextGradeAlertView();
             },
 
+            // 🌟 신규 핵심: 메모리 변수(this.state.alert)만을 참조하여 즉시 그리기
             updateNextGradeAlertView() {
-                const activeAlert = localStorage.getItem('qpass_active_alert') || 'none';
+                const activeAlert = this.state.alert;
                 const banner = document.getElementById('next-grade-banner');
                 const bannerTitle = document.getElementById('banner-title');
                 const bannerDesc = document.getElementById('banner-desc');
@@ -553,22 +562,22 @@
                         statusEl.className = "text-2xl font-bold text-green-500 mt-2";
                     }
 
-                    try { localStorage.setItem('qpass_count', personCount.toString()); } catch(e) {}
+                    // 메모리 상태 즉시 업데이트
+                    this.state.count = personCount;
 
-                    // 분할(듀얼) 모드일 때 즉각적으로 UI 갱신 반영
+                    // 분할(듀얼) 모드일 때 즉각적으로 우측 신호등 UI 갱신 반영
                     const isDualMode = document.body.classList.contains('lg:grid');
-                    if(isDualMode) {
+                    if (isDualMode) {
                         this.updateUserView();
                     }
 
-                    // 브로드캐스트 채널을 통한 인원 변경 알림 (다른 탭용)
-                    const currentAlert = localStorage.getItem('qpass_active_alert') || 'none';
+                    // 다른 창(탭)이 켜져 있을 때 방송하기
                     if (this.lastSentCount !== personCount) {
                         this.lastSentCount = personCount;
                         this.syncChannel.postMessage({
                             type: 'state_update',
                             count: personCount,
-                            alert: currentAlert
+                            alert: this.state.alert
                         });
                     }
 
@@ -589,12 +598,11 @@
                 this.video.srcObject = null;
                 if(this.ctx && this.canvas) this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
                 
-                try { localStorage.setItem('qpass_count', '0'); } catch(e) {}
-                
+                this.state.count = 0;
                 this.syncChannel.postMessage({
                     type: 'state_update',
                     count: 0,
-                    alert: localStorage.getItem('qpass_active_alert') || 'none'
+                    alert: this.state.alert
                 });
             }
         };
